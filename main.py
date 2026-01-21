@@ -7,7 +7,7 @@ from datetime import datetime
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import CreateChannelRequest
-from telethon.tl.functions.messages import UpdatePinnedMessageRequest
+from telethon.tl.functions.messages import UpdatePinnedMessageRequest, ExportChatInviteRequest
 from telethon.tl.functions.folders import EditPeerFoldersRequest
 from telethon.tl.types import InputFolderPeer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -87,7 +87,6 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             for proj in projects:
                 status_icon = "✅" if proj[6] == 'complete' else "⏳"
-                # Database schema: id(0), name(1), type(2), quantity(3), folder(4), folder_id(5), status(6), created_at(7)
                 created_at = proj[7] if len(proj) > 7 else None
                 time_str = created_at.split(' ')[1][:5] if created_at and ' ' in created_at else "--:--"
                 text += f"{status_icon} <b>{proj[1]}</b> ({proj[2]})\n"
@@ -278,13 +277,55 @@ async def execute_creation(update, context, project_id, folder_name):
                 continue
             try:
                 title = f"{base_name}{num:03d}"
-                result = await client(CreateChannelRequest(title=title, about="Service", megagroup=(p_type == 'group')))
+                # Create private channel (megagroup False and no username)
+                result = await client(CreateChannelRequest(
+                    title=title, 
+                    about="Service", 
+                    megagroup=(p_type == 'group')
+                ))
                 channel = result.chats[0]
+                
+                # Wait for channel to be ready
                 await asyncio.sleep(2)
+                
+                # Get Invite Link
+                invite_link = "None"
                 try:
-                    await client.send_file(channel, 'birth_cert.jpg', caption=title)
-                    await client(UpdatePinnedMessageRequest(channel=channel, id=1, pm_oneside=True))
+                    invite = await client(ExportChatInviteRequest(peer=channel))
+                    invite_link = invite.link
                 except: pass
+
+                # Get Creation Stats
+                now = datetime.now()
+                creation_date = now.strftime("%Y-%m-%d")
+                creation_time = now.strftime("%I:%M %p")
+                
+                cert_msg = (
+                    "<b>CHANNEL BIRTH CERTIFICATE</b>\n"
+                    "----------------------------------\n\n"
+                    "<b>1. Channel Age Details:</b>\n"
+                    f"   -Creation Date: {creation_date}\n"
+                    f"   -Creation Time: {creation_time}\n"
+                    f"   -Channel Type: {p_type.capitalize()}\n\n"
+                    "<b>2. Key Identification:</b>\n"
+                    f"   -Unique Channel ID: <code>{channel.id}</code>\n"
+                    f"   -Initial Invite Link: {invite_link}\n\n"
+                    "<b>3. Status &amp; Goal:</b>\n"
+                    "   -Initial Users: 1 (Creator)\n\n"
+                    "<b>4. User/Data Source (For Future Value):</b>\n"
+                    "   -Current Users: None\n"
+                    "   -User Source/Acquisition Method: None\n\n"
+                    "<i>Note: This post is pinned to confirm the channel's creation age.</i>"
+                )
+
+                # Post & Pin Certificate
+                try:
+                    sent_cert = await client.send_message(channel, cert_msg, parse_mode='html')
+                    await client(UpdatePinnedMessageRequest(channel=channel, id=sent_cert.id, pm_oneside=True))
+                except Exception as e:
+                    print(f"Cert error: {e}")
+
+                # Archive
                 try:
                     await client(EditPeerFoldersRequest(folder_peers=[InputFolderPeer(peer=channel, folder_id=1)]))
                 except: pass
@@ -293,7 +334,8 @@ async def execute_creation(update, context, project_id, folder_name):
                 await update_daily_count(1)
                 num += 1
                 await asyncio.sleep(60)
-            except Exception:
+            except Exception as e:
+                print(f"Loop error: {e}")
                 num += 1
                 continue
         cursor.execute("UPDATE projects SET status='complete' WHERE id=?", (project_id,))
