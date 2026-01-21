@@ -69,6 +69,12 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if query.data == 'menu_add':
+        creds = await get_creds()
+        if not creds or not creds[3]:
+            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
+            await query.edit_message_text("❌ <b>Login Required!</b>\n\nProject add karne ke liye pehle <b>My Account</b> mein jaakar login kare.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+            return MENU
+            
         keyboard = [
             [InlineKeyboardButton("📢 Create Channel", callback_data='type_channel'),
              InlineKeyboardButton("👥 Create Group", callback_data='type_group')],
