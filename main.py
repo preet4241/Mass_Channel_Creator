@@ -1,9 +1,10 @@
 import asyncio
 import sqlite3
 import logging
+import re
 from datetime import datetime
 from telethon import TelegramClient
-from telethon.tl.functions.channels import CreateChannelRequest
+from telethon.tl.functions.channels import CreateChannelRequest, GetFullChannelRequest
 from telethon.tl.functions.messages import UpdatePinnedMessageRequest
 from telethon.tl.functions.folders import EditPeerFoldersRequest
 from telethon.tl.types import InputFolderPeer
@@ -72,17 +73,12 @@ async def type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data['project_type'] = 'channel' if 'channel' in query.data else 'group'
-    await query.edit_message_text(f"How many {context.user_data['project_type']}s create karne hai? (Max 20/day)")
+    await query.edit_message_text(f"How many {context.user_data['project_type']}s create karne hai? (Total Project Quantity)")
     return WAIT_QUANTITY
 
 async def get_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         qty = int(update.message.text)
-        current_today = await check_daily_limit()
-        if current_today + qty > 20:
-            await update.message.reply_text(f"Limit exceed! Today created: {current_today}. You can only create {20 - current_today} more today.")
-            return WAIT_QUANTITY
-        
         context.user_data['quantity'] = qty
         keyboard = [[InlineKeyboardButton("Skip Folder", callback_data='skip_folder')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -99,12 +95,12 @@ async def get_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query:
         await query.answer()
         folder_name = "None"
-        await query.edit_message_text("Starting normal creation without folder...")
+        await query.edit_message_text("Starting normal creation...")
     else:
         folder_name = update.message.text
-        await update.message.reply_text(f"Starting creation in folder: {folder_name}...")
+        await update.message.reply_text(f"Starting creation in folder/prefix: {folder_name}...")
 
-    project_name = f"{folder_name}-n" if folder_name != "None" else "Channel-n"
+    project_name = f"{folder_name}" if folder_name != "None" else "Channel"
     
     # Save to DB
     cursor.execute("INSERT INTO projects (name, type, quantity, folder, status) VALUES (?, ?, ?, ?, ?)",
@@ -123,23 +119,36 @@ async def execute_creation(update, context, project_id, folder_name):
 
     cursor.execute("SELECT * FROM projects WHERE id=?", (project_id,))
     proj = cursor.fetchone()
-    qty = proj[3]
+    total_qty = proj[3]
     p_type = proj[2]
     
-    # Logic for n-suffix: if folder is Channel-A, name will be Channel-A001
     base_name = folder_name if folder_name != "None" else "Channel"
     
+    # Logic to detect existing numbers
+    existing_numbers = set()
+    async for dialog in client.iter_dialogs():
+        if dialog.name.startswith(base_name):
+            match = re.search(rf"{re.escape(base_name)}(\d+)", dialog.name)
+            if match:
+                existing_numbers.add(int(match.group(1)))
+    
     created_count = 0
-    for i in range(qty):
-        try:
-            # Check daily limit again inside loop just in case
-            if await check_daily_limit() >= 20:
-                msg = "🛑 Daily limit of 20 reached. Stopping for today."
-                if update.message: await update.message.reply_text(msg)
-                else: await update.callback_query.message.reply_text(msg)
-                break
+    num = 1
+    while created_count < total_qty:
+        # Per-day limit check
+        if await check_daily_limit() >= 20:
+            msg = f"⏳ Daily limit (20) reached. Project {proj[1]} paused. Bot will continue tomorrow or when limit resets."
+            if update.message: await update.message.reply_text(msg)
+            else: await update.callback_query.message.reply_text(msg)
+            return # Stop for today but status remains processing
 
-            title = f"{base_name}{i+1:03d}"
+        # Skip existing or missing numbers logic
+        if num in existing_numbers:
+            num += 1
+            continue
+
+        try:
+            title = f"{base_name}{num:03d}"
             result = await client(CreateChannelRequest(
                 title=title, 
                 about="Birth Certificate Services",
@@ -149,30 +158,40 @@ async def execute_creation(update, context, project_id, folder_name):
             
             # Post & Pin
             try:
+                # Wait for channel to be ready
+                await asyncio.sleep(2)
                 await client.send_file(channel, 'birth_cert.jpg', caption=f"🔥 **Service Available**\n\n{title}")
                 await client(UpdatePinnedMessageRequest(channel=channel, id=1, pm_oneside=True))
-            except: pass
+            except Exception as e:
+                print(f"Post/Pin error: {e}")
 
             # Archive / Folder logic
-            if folder_name != "None":
-                # Note: Real folder creation in Telethon is complex (DialogFilters)
-                # For simplicity, we archive them to "Archived" if no folder, 
-                # or just process them as requested.
-                pass
+            try:
+                # Folder ID 1 is usually Archive in Telegram
+                await client(EditPeerFoldersRequest(folder_peers=[InputFolderPeer(peer=channel, folder_id=1)]))
+            except Exception as e:
+                print(f"Archive error: {e}")
             
             created_count += 1
             await update_daily_count(1)
-            await asyncio.sleep(60) # Reduced for safety but faster
+            num += 1
+            
+            # Safety delay
+            await asyncio.sleep(60)
             
         except Exception as e:
-            msg = f"Error creating {i+1}: {str(e)}"
+            msg = f"Error creating {title}: {str(e)}"
+            if "flood" in str(e).lower():
+                await update.message.reply_text("🛑 Flood wait triggered. Stopping for now.")
+                return
             if update.message: await update.message.reply_text(msg)
+            num += 1
             continue
 
     cursor.execute("UPDATE projects SET status='complete' WHERE id=?", (project_id,))
     conn.commit()
     
-    final_msg = f"✅ **Finished!** Created {created_count} {p_type}s."
+    final_msg = f"✅ **Project Complete!** Created {created_count} {p_type}s for {base_name}."
     if update.message: await update.message.reply_text(final_msg)
     else: await update.callback_query.message.reply_text(final_msg)
 
