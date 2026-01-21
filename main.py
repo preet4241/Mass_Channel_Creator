@@ -2,8 +2,10 @@ import asyncio
 import sqlite3
 import logging
 import re
+import os
 from datetime import datetime
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.functions.channels import CreateChannelRequest
 from telethon.tl.functions.messages import UpdatePinnedMessageRequest
 from telethon.tl.functions.folders import EditPeerFoldersRequest
@@ -12,9 +14,6 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # Config
-API_ID = '22880380'
-API_HASH = '08dae0d98b2dc8f8dc4e6a9ff97a071b'
-PHONE = '+917000275199'
 BOT_TOKEN = '8028312869:AAErsD7WmHHw11c2lL2Jdoj_DBU4bqRv_kQ'
 
 # Database setup
@@ -24,10 +23,13 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS projects
                  (id INTEGER PRIMARY KEY, name TEXT, type TEXT, quantity INTEGER, 
                   folder TEXT, folder_id INTEGER, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 cursor.execute('''CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, count INTEGER DEFAULT 0)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS credentials 
+                 (id INTEGER PRIMARY KEY, api_id TEXT, api_hash TEXT, phone TEXT, session_str TEXT)''')
 conn.commit()
 
 # States
-WAIT_TYPE, WAIT_QUANTITY, WAIT_FOLDER = range(3)
+(MENU, WAIT_TYPE, WAIT_QUANTITY, WAIT_FOLDER, 
+ LOGIN_API_ID, LOGIN_API_HASH, LOGIN_PHONE, LOGIN_OTP, LOGIN_PASSWORD) = range(9)
 
 async def check_daily_limit():
     today = datetime.now().strftime('%Y-%m-%d')
@@ -44,43 +46,169 @@ async def update_daily_count(add):
     cursor.execute("UPDATE daily_stats SET count = count + ? WHERE date=?", (add, today))
     conn.commit()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("📢 Create Channel", callback_data='type_channel')],
-                [InlineKeyboardButton("👥 Create Group", callback_data='type_group')],
-                [InlineKeyboardButton("📊 Status", callback_data='status')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text('🤖 **Smart Manager Bot**\n\nChoose what to create:', reply_markup=reply_markup, parse_mode='Markdown')
-    return WAIT_TYPE
+async def get_creds():
+    cursor.execute("SELECT api_id, api_hash, phone, session_str FROM credentials LIMIT 1")
+    return cursor.fetchone()
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Project", callback_data='menu_add')],
+        [InlineKeyboardButton("👤 My Account", callback_data='menu_account'),
+         InlineKeyboardButton("📊 Status", callback_data='menu_status')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg = '🤖 **Smart Manager Bot**\n\nChoose an option:'
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+    else:
+        await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+    return MENU
+
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'menu_add':
+        keyboard = [
+            [InlineKeyboardButton("📢 Create Channel", callback_data='type_channel'),
+             InlineKeyboardButton("👥 Create Group", callback_data='type_group')],
+            [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text('Select what to create:', reply_markup=reply_markup)
+        return WAIT_TYPE
+
+    elif query.data == 'menu_status':
+        cursor.execute("SELECT * FROM projects ORDER BY created_at DESC LIMIT 10")
+        projects = cursor.fetchall()
+        text = "📋 **Projects Status**\n\n"
+        if not projects:
+            text += "No projects yet!"
+        else:
+            for proj in projects:
+                status = "✅ Complete" if proj[6] == 'complete' else "⏳ Processing"
+                text += f"• {proj[1]} ({proj[2]}) - {proj[3]} - {status}\n"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return MENU
+
+    elif query.data == 'menu_account':
+        creds = await get_creds()
+        if not creds or not creds[3]:
+            await query.edit_message_text("❌ No account logged in.\n\nPlease provide **API ID** to start login:")
+            return LOGIN_API_ID
+        
+        text = f"👤 **Account Info**\n\nPhone: `{creds[2]}`\nAPI ID: `{creds[0]}`\nStatus: ✅ Logged In"
+        keyboard = [
+            [InlineKeyboardButton("Logout", callback_data='account_logout')],
+            [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return MENU
+
+    elif query.data == 'account_logout':
+        cursor.execute("DELETE FROM credentials")
+        conn.commit()
+        if os.path.exists('session.session'): os.remove('session.session')
+        await query.edit_message_text("✅ Logged out successfully.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]))
+        return MENU
+
+    elif query.data == 'back_to_main':
+        return await start(update, context)
+
+# --- LOGIN FLOW ---
+async def login_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['login_api_id'] = update.message.text
+    await update.message.reply_text("Send **API Hash**:")
+    return LOGIN_API_HASH
+
+async def login_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['login_api_hash'] = update.message.text
+    await update.message.reply_text("Send **Phone Number** (with country code, e.g., +91...):")
+    return LOGIN_PHONE
+
+async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text
+    context.user_data['login_phone'] = phone
+    
+    api_id = context.user_data['login_api_id']
+    api_hash = context.user_data['login_api_hash']
+    
+    client = TelegramClient(StringSession(), api_id, api_hash)
+    await client.connect()
+    try:
+        sent = await client.send_code_request(phone)
+        context.user_data['phone_code_hash'] = sent.phone_code_hash
+        context.user_data['login_client'] = client # Keep client alive
+        await update.message.reply_text("OTP sent! Please send the **OTP**:")
+        return LOGIN_OTP
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}\n\nRestart login with /start")
+        await client.disconnect()
+        return ConversationHandler.END
+
+async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    otp = update.message.text
+    client = context.user_data['login_client']
+    phone = context.user_data['login_phone']
+    code_hash = context.user_data['phone_code_hash']
+    
+    try:
+        await client.sign_in(phone, otp, phone_code_hash=code_hash)
+        # Success!
+        session_str = client.session.save()
+        cursor.execute("DELETE FROM credentials")
+        cursor.execute("INSERT INTO credentials (api_id, api_hash, phone, session_str) VALUES (?, ?, ?, ?)",
+                      (context.user_data['login_api_id'], context.user_data['login_api_hash'], phone, session_str))
+        conn.commit()
+        await update.message.reply_text("✅ Login successful!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Go to Menu", callback_data='back_to_main')]]))
+        await client.disconnect()
+        return MENU
+    except Exception as e:
+        if "password" in str(e).lower():
+            await update.message.reply_text("This account has 2FA. Please send your **Password**:")
+            return LOGIN_PASSWORD
+        await update.message.reply_text(f"Error: {e}")
+        await client.disconnect()
+        return ConversationHandler.END
+
+async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text
+    client = context.user_data['login_client']
+    try:
+        await client.sign_in(password=password)
+        session_str = client.session.save()
+        cursor.execute("DELETE FROM credentials")
+        cursor.execute("INSERT INTO credentials (api_id, api_hash, phone, session_str) VALUES (?, ?, ?, ?)",
+                      (context.user_data['login_api_id'], context.user_data['login_api_hash'], context.user_data['login_phone'], session_str))
+        conn.commit()
+        await update.message.reply_text("✅ Login successful (2FA)!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Go to Menu", callback_data='back_to_main')]]))
+        await client.disconnect()
+        return MENU
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+        await client.disconnect()
+        return ConversationHandler.END
+
+# --- PROJECT FLOW ---
 async def type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == 'status':
-        cursor.execute("SELECT * FROM projects ORDER BY created_at DESC LIMIT 10")
-        projects = cursor.fetchall()
-        if not projects:
-            await query.edit_message_text('No projects yet!')
-            return ConversationHandler.END
+    if query.data == 'back_to_main':
+        return await start(update, context)
         
-        text = "📋 **Projects Status**\n\n"
-        for proj in projects:
-            status = "✅ Complete" if proj[6] == 'complete' else "⏳ Processing"
-            text += f"• {proj[1]} ({proj[2]}) - {proj[3]} - {status}\n"
-        await query.edit_message_text(text, parse_mode='Markdown')
-        return ConversationHandler.END
-
     context.user_data['project_type'] = 'channel' if 'channel' in query.data else 'group'
-    await query.edit_message_text(f"How many {context.user_data['project_type']}s create karne hai? (Total Project Quantity)")
+    await query.edit_message_text(f"How many {context.user_data['project_type']}s create karne hai?")
     return WAIT_QUANTITY
 
 async def get_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         qty = int(update.message.text)
         context.user_data['quantity'] = qty
-        keyboard = [[InlineKeyboardButton("Skip Folder", callback_data='skip_folder')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text('Folder name batao (like Channel-A) ya skip karo:', reply_markup=reply_markup)
+        keyboard = [[InlineKeyboardButton("Skip Folder", callback_data='skip_folder')], [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
+        await update.message.reply_text('Folder name batao (like Channel-A) ya skip karo:', reply_markup=InlineKeyboardMarkup(keyboard))
         return WAIT_FOLDER
     except ValueError:
         await update.message.reply_text('Valid number daal bhai!')
@@ -92,17 +220,16 @@ async def get_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query:
         await query.answer()
+        if query.data == 'back_to_main': return await start(update, context)
         folder_name = "None"
-        await query.edit_message_text("Starting normal creation...")
+        await query.edit_message_text("Starting creation...")
     else:
         folder_name = update.message.text
-        await update.message.reply_text(f"Starting creation in folder/prefix: {folder_name}...")
+        await update.message.reply_text(f"Starting creation in: {folder_name}...")
 
-    project_name = f"{folder_name}" if folder_name != "None" else "Channel"
-    
     cursor.execute("INSERT INTO projects (name, type, quantity, folder, status) VALUES (?, ?, ?, ?, ?)",
-                  (project_name, context.user_data['project_type'], context.user_data['quantity'], 
-                   folder_name, 'processing'))
+                  (folder_name if folder_name != "None" else "Channel", context.user_data['project_type'], 
+                   context.user_data['quantity'], folder_name, 'processing'))
     conn.commit()
     project_id = cursor.lastrowid
 
@@ -110,54 +237,40 @@ async def get_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def execute_creation(update, context, project_id, folder_name):
-    client = TelegramClient('session', API_ID, API_HASH)
+    creds = await get_creds()
+    if not creds: return
+    
+    client = TelegramClient(StringSession(creds[3]), creds[0], creds[1])
     try:
         await client.connect()
-        if not await client.is_user_authorized():
-            await client.start(phone=PHONE)
-
         cursor.execute("SELECT * FROM projects WHERE id=?", (project_id,))
         proj = cursor.fetchone()
         total_qty = proj[3]
         p_type = proj[2]
-        
         base_name = folder_name if folder_name != "None" else "Channel"
         
         existing_numbers = set()
         async for dialog in client.iter_dialogs():
             if dialog.name and dialog.name.startswith(base_name):
                 match = re.search(rf"{re.escape(base_name)}(\d+)", dialog.name)
-                if match:
-                    existing_numbers.add(int(match.group(1)))
+                if match: existing_numbers.add(int(match.group(1)))
         
         created_count = 0
         num = 1
         while created_count < total_qty:
-            if await check_daily_limit() >= 20:
-                msg = f"⏳ Daily limit (20) reached. Project {proj[1]} paused."
-                if update.message: await update.message.reply_text(msg)
-                else: await update.callback_query.message.reply_text(msg)
-                return
-
+            if await check_daily_limit() >= 20: return
             if num in existing_numbers:
                 num += 1
                 continue
-
             try:
                 title = f"{base_name}{num:03d}"
-                result = await client(CreateChannelRequest(
-                    title=title, 
-                    about="Birth Certificate Services",
-                    megagroup=(p_type == 'group')
-                ))
+                result = await client(CreateChannelRequest(title=title, about="Service", megagroup=(p_type == 'group')))
                 channel = result.chats[0]
-                
                 await asyncio.sleep(2)
                 try:
-                    await client.send_file(channel, 'birth_cert.jpg', caption=f"🔥 **Service Available**\n\n{title}")
+                    await client.send_file(channel, 'birth_cert.jpg', caption=title)
                     await client(UpdatePinnedMessageRequest(channel=channel, id=1, pm_oneside=True))
                 except: pass
-
                 try:
                     await client(EditPeerFoldersRequest(folder_peers=[InputFolderPeer(peer=channel, folder_id=1)]))
                 except: pass
@@ -166,22 +279,11 @@ async def execute_creation(update, context, project_id, folder_name):
                 await update_daily_count(1)
                 num += 1
                 await asyncio.sleep(60)
-                
-            except Exception as e:
-                msg = f"Error creating {title}: {str(e)}"
-                if "flood" in str(e).lower():
-                    await update.message.reply_text("🛑 Flood wait triggered. Stopping for now.")
-                    return
-                if update.message: await update.message.reply_text(msg)
+            except Exception:
                 num += 1
                 continue
-
         cursor.execute("UPDATE projects SET status='complete' WHERE id=?", (project_id,))
         conn.commit()
-        
-        final_msg = f"✅ **Project Complete!** Created {created_count} {p_type}s."
-        if update.message: await update.message.reply_text(final_msg)
-        else: await update.callback_query.message.reply_text(final_msg)
     finally:
         await client.disconnect()
 
@@ -191,10 +293,17 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
+            MENU: [CallbackQueryHandler(menu_handler)],
             WAIT_TYPE: [CallbackQueryHandler(type_handler)],
             WAIT_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_quantity)],
             WAIT_FOLDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_folder),
-                         CallbackQueryHandler(get_folder, pattern='^skip_folder$')]
+                         CallbackQueryHandler(get_folder, pattern='^skip_folder$'),
+                         CallbackQueryHandler(type_handler, pattern='^back_to_main$')],
+            LOGIN_API_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_api_id)],
+            LOGIN_API_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_api_hash)],
+            LOGIN_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
+            LOGIN_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)],
+            LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
         },
         fallbacks=[CommandHandler("start", start)]
     )
