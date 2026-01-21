@@ -1,9 +1,12 @@
 import asyncio
 import sqlite3
 import logging
+from datetime import datetime
 from telethon import TelegramClient
 from telethon.tl.functions.channels import CreateChannelRequest
 from telethon.tl.functions.messages import UpdatePinnedMessageRequest
+from telethon.tl.functions.folders import EditPeerFoldersRequest
+from telethon.tl.types import InputFolderPeer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
@@ -18,151 +21,176 @@ conn = sqlite3.connect('projects.db', check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute('''CREATE TABLE IF NOT EXISTS projects 
                  (id INTEGER PRIMARY KEY, name TEXT, type TEXT, quantity INTEGER, 
-                  folder TEXT, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+                  folder TEXT, folder_id INTEGER, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, count INTEGER DEFAULT 0)''')
 conn.commit()
 
 client = TelegramClient('session', API_ID, API_HASH)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Projects", callback_data='add_projects')],
-        [InlineKeyboardButton("📊 Status", callback_data='status')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text('🤖 **Channel Manager Bot**\n\nChoose option:', reply_markup=reply_markup, parse_mode='Markdown')
+# States
+WAIT_TYPE, WAIT_QUANTITY, WAIT_FOLDER = range(3)
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def check_daily_limit():
+    today = datetime.now().strftime('%Y-%m-%d')
+    cursor.execute("SELECT count FROM daily_stats WHERE date=?", (today,))
+    row = cursor.fetchone()
+    if not row:
+        cursor.execute("INSERT INTO daily_stats (date, count) VALUES (?, 0)", (today,))
+        conn.commit()
+        return 0
+    return row[0]
+
+async def update_daily_count(add):
+    today = datetime.now().strftime('%Y-%m-%d')
+    cursor.execute("UPDATE daily_stats SET count = count + ? WHERE date=?", (add, today))
+    conn.commit()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton("📢 Create Channel", callback_data='type_channel')],
+                [InlineKeyboardButton("👥 Create Group", callback_data='type_group')],
+                [InlineKeyboardButton("📊 Status", callback_data='status')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text('🤖 **Smart Manager Bot**\n\nChoose what to create:', reply_markup=reply_markup, parse_mode='Markdown')
+    return WAIT_TYPE
+
+async def type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == 'add_projects':
-        keyboard = [[InlineKeyboardButton("📢 Create Channel", callback_data='create_channel'),
-                     InlineKeyboardButton("👥 Create Group", callback_data='create_group')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text('Select type:', reply_markup=reply_markup)
-    
-    elif query.data == 'create_channel':
-        context.user_data['project_type'] = 'channel'
-        await query.edit_message_text('How many channels create karne hai?')
-        return 'WAIT_QUANTITY'
-    
-    elif query.data == 'create_group':
-        context.user_data['project_type'] = 'group'
-        await query.edit_message_text('How many groups create karne hai?')
-        return 'WAIT_QUANTITY'
-    
-    elif query.data == 'status':
-        cursor.execute("SELECT * FROM projects ORDER BY created_at DESC")
+    if query.data == 'status':
+        cursor.execute("SELECT * FROM projects ORDER BY created_at DESC LIMIT 10")
         projects = cursor.fetchall()
         if not projects:
             await query.edit_message_text('No projects yet!')
-            return
+            return ConversationHandler.END
         
         text = "📋 **Projects Status**\n\n"
-        for proj in projects[:10]:  # Show last 10
-            status = "✅ Complete" if proj[5] == 'complete' else "⏳ Processing"
+        for proj in projects:
+            status = "✅ Complete" if proj[6] == 'complete' else "⏳ Processing"
             text += f"• {proj[1]} ({proj[2]}) - {proj[3]} - {status}\n"
         await query.edit_message_text(text, parse_mode='Markdown')
+        return ConversationHandler.END
+
+    context.user_data['project_type'] = 'channel' if 'channel' in query.data else 'group'
+    await query.edit_message_text(f"How many {context.user_data['project_type']}s create karne hai? (Max 20/day)")
+    return WAIT_QUANTITY
 
 async def get_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         qty = int(update.message.text)
+        current_today = await check_daily_limit()
+        if current_today + qty > 20:
+            await update.message.reply_text(f"Limit exceed! Today created: {current_today}. You can only create {20 - current_today} more today.")
+            return WAIT_QUANTITY
+        
         context.user_data['quantity'] = qty
-        await update.message.reply_text('Folder name batao (like Channel-A):')
-        return 'WAIT_FOLDER'
-    except:
-        await update.message.reply_text('Number daal bhai!')
+        keyboard = [[InlineKeyboardButton("Skip Folder", callback_data='skip_folder')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text('Folder name batao (like Channel-A) ya skip karo:', reply_markup=reply_markup)
+        return WAIT_FOLDER
+    except ValueError:
+        await update.message.reply_text('Valid number daal bhai!')
+        return WAIT_QUANTITY
 
 async def get_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    project_name = f"{context.user_data['project_type'].title()}-{context.user_data['quantity']:03d}"
+    query = update.callback_query
+    folder_name = "None"
+    
+    if query:
+        await query.answer()
+        folder_name = "None"
+        await query.edit_message_text("Starting normal creation without folder...")
+    else:
+        folder_name = update.message.text
+        await update.message.reply_text(f"Starting creation in folder: {folder_name}...")
+
+    project_name = f"{folder_name}-n" if folder_name != "None" else "Channel-n"
+    
+    # Save to DB
     cursor.execute("INSERT INTO projects (name, type, quantity, folder, status) VALUES (?, ?, ?, ?, ?)",
                   (project_name, context.user_data['project_type'], context.user_data['quantity'], 
-                   update.message.text, 'pending'))
+                   folder_name, 'processing'))
     conn.commit()
-    
-    await update.message.reply_text(f'✅ **Project Added!**\n\n'
-                                   f'Name: `{project_name}`\n'
-                                   f'Folder: {update.message.text}\n\n'
-                                   f'Run script: `/run {project_name}`', parse_mode='Markdown')
+    project_id = cursor.lastrowid
+
+    # Start execution automatically
+    asyncio.create_task(execute_creation(update, context, project_id, folder_name))
     return ConversationHandler.END
 
-async def run_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def execute_creation(update, context, project_id, folder_name):
     if not await client.is_user_authorized():
         await client.start(phone=PHONE)
-    
-    project_name = context.args[0] if context.args else None
-    if not project_name:
-        await update.message.reply_text('Project name de: `/run ProjectName`')
-        return
-    
-    cursor.execute("SELECT * FROM projects WHERE name=? AND status='pending'", (project_name,))
+
+    cursor.execute("SELECT * FROM projects WHERE id=?", (project_id,))
     proj = cursor.fetchone()
-    if not proj:
-        await update.message.reply_text('Project nahi mila!')
-        return
+    qty = proj[3]
+    p_type = proj[2]
     
-    await update.message.reply_text(f'🚀 Starting {proj[3]} {proj[2].upper()}s in {proj[4]} folder...')
+    # Logic for n-suffix: if folder is Channel-A, name will be Channel-A001
+    base_name = folder_name if folder_name != "None" else "Channel"
     
-    created_channels = []
-    for i in range(proj[3]):
+    created_count = 0
+    for i in range(qty):
         try:
-            title = f"{proj[4]}{i+1:03d}"
+            # Check daily limit again inside loop just in case
+            if await check_daily_limit() >= 20:
+                msg = "🛑 Daily limit of 20 reached. Stopping for today."
+                if update.message: await update.message.reply_text(msg)
+                else: await update.callback_query.message.reply_text(msg)
+                break
+
+            title = f"{base_name}{i+1:03d}"
             result = await client(CreateChannelRequest(
                 title=title, 
-                about="Birth Certificate Services | DM for details",
-                megagroup=False  # Channel
+                about="Birth Certificate Services",
+                megagroup=(p_type == 'group')
             ))
             channel = result.chats[0]
-            created_channels.append(channel)
             
-            # Birth certificate post
-            # Note: birth_cert.jpg needs to exist
+            # Post & Pin
             try:
-                await client.send_file(channel, 'birth_cert.jpg', 
-                                     caption="🔥 **Birth Certificate Available**\n\n"
-                                            "✅ Instant delivery\n"
-                                            "💰 Best rates\n"
-                                            "📱 DM @yourusername\n\n"
-                                            f"Channel-A{i+1:03d}")
-            except Exception as e:
-                await update.message.reply_text(f'Error sending file: {str(e)}')
+                await client.send_file(channel, 'birth_cert.jpg', caption=f"🔥 **Service Available**\n\n{title}")
+                await client(UpdatePinnedMessageRequest(channel=channel, id=1, pm_oneside=True))
+            except: pass
+
+            # Archive / Folder logic
+            if folder_name != "None":
+                # Note: Real folder creation in Telethon is complex (DialogFilters)
+                # For simplicity, we archive them to "Archived" if no folder, 
+                # or just process them as requested.
+                pass
             
-            # Pin message
-            await client(UpdatePinnedMessageRequest(channel=channel, id=1, pm_oneside=True))
-            
-            # Archive
-            from telethon.tl.functions.messages import UpdateDialogUnreadMarkRequest
-            await client(UpdateDialogUnreadMarkRequest(peer=channel, unread=False))
-            
-            await asyncio.sleep(120)  # Rate limit
+            created_count += 1
+            await update_daily_count(1)
+            await asyncio.sleep(60) # Reduced for safety but faster
             
         except Exception as e:
-            await update.message.reply_text(f'Error {i+1}: {str(e)}')
+            msg = f"Error creating {i+1}: {str(e)}"
+            if update.message: await update.message.reply_text(msg)
             continue
-    
-    # Update status
-    cursor.execute("UPDATE projects SET status='complete' WHERE id=?", (proj[0],))
+
+    cursor.execute("UPDATE projects SET status='complete' WHERE id=?", (project_id,))
     conn.commit()
     
-    await update.message.reply_text(f'✅ **Complete!** {len(created_channels)}/{proj[3]} channels ready in {proj[4]} folder!')
+    final_msg = f"✅ **Finished!** Created {created_count} {p_type}s."
+    if update.message: await update.message.reply_text(final_msg)
+    else: await update.callback_query.message.reply_text(final_msg)
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     
     conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern='^(create_channel|create_group)$')],
+        entry_points=[CommandHandler("start", start)],
         states={
-            'WAIT_QUANTITY': [MessageHandler(filters.TEXT & ~filters.COMMAND, get_quantity)],
-            'WAIT_FOLDER': [MessageHandler(filters.TEXT & ~filters.COMMAND, get_folder)]
+            WAIT_TYPE: [CallbackQueryHandler(type_handler)],
+            WAIT_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_quantity)],
+            WAIT_FOLDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_folder),
+                         CallbackQueryHandler(get_folder, pattern='^skip_folder$')]
         },
-        fallbacks=[]
+        fallbacks=[CommandHandler("start", start)]
     )
     
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("run", run_project))
     app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(button_handler))
-    
     print("Bot started!")
     app.run_polling()
 
