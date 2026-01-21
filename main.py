@@ -87,7 +87,9 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             for proj in projects:
                 status_icon = "✅" if proj[6] == 'complete' else "⏳"
-                time_str = proj[7].split(' ')[1][:5] if proj[7] else "--:--"
+                # Database schema: id(0), name(1), type(2), quantity(3), folder(4), folder_id(5), status(6), created_at(7)
+                created_at = proj[7] if len(proj) > 7 else None
+                time_str = created_at.split(' ')[1][:5] if created_at and ' ' in created_at else "--:--"
                 text += f"{status_icon} <b>{proj[1]}</b> ({proj[2]})\n"
                 text += f"   └ Qty: {proj[3]} | Folder: {proj[4]} | {time_str}\n\n"
         
