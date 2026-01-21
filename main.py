@@ -57,11 +57,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("📊 Status", callback_data='menu_status')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    msg = '🤖 **Smart Manager Bot**\n\nChoose an option:'
+    msg = '🤖 <b>Smart Manager Bot</b>\n\nChoose an option:'
     if update.callback_query:
-        await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+        await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='HTML')
     else:
-        await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+        await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='HTML')
     return MENU
 
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -81,37 +81,39 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == 'menu_status':
         cursor.execute("SELECT * FROM projects ORDER BY created_at DESC LIMIT 10")
         projects = cursor.fetchall()
-        text = "📋 **Projects Status**\n\n"
+        text = "📋 <b>Recent Projects Status</b>\n\n"
         if not projects:
             text += "No projects yet!"
         else:
             for proj in projects:
-                status = "✅ Complete" if proj[6] == 'complete' else "⏳ Processing"
-                text += f"• {proj[1]} ({proj[2]}) - {proj[3]} - {status}\n"
+                status_icon = "✅" if proj[6] == 'complete' else "⏳"
+                time_str = proj[7].split(' ')[1][:5] if proj[7] else "--:--"
+                text += f"{status_icon} <b>{proj[1]}</b> ({proj[2]})\n"
+                text += f"   └ Qty: {proj[3]} | Folder: {proj[4]} | {time_str}\n\n"
         
         keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         return MENU
 
     elif query.data == 'menu_account':
         creds = await get_creds()
         if not creds or not creds[3]:
-            await query.edit_message_text("❌ No account logged in.\n\nPlease provide **API ID** to start login:")
+            keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')]]
+            await query.edit_message_text("❌ <b>No account logged in.</b>\n\nPlease provide <b>API ID</b> to start login:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
             return LOGIN_API_ID
         
-        text = f"👤 **Account Info**\n\nPhone: `{creds[2]}`\nAPI ID: `{creds[0]}`\nStatus: ✅ Logged In"
+        text = f"👤 <b>Account Info</b>\n\nPhone: <code>{creds[2]}</code>\nAPI ID: <code>{creds[0]}</code>\nStatus: ✅ <b>Logged In</b>"
         keyboard = [
             [InlineKeyboardButton("Logout", callback_data='account_logout')],
             [InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]
         ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         return MENU
 
     elif query.data == 'account_logout':
         cursor.execute("DELETE FROM credentials")
         conn.commit()
-        if os.path.exists('session.session'): os.remove('session.session')
-        await query.edit_message_text("✅ Logged out successfully.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]))
+        await query.edit_message_text("✅ <b>Logged out successfully.</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]), parse_mode='HTML')
         return MENU
 
     elif query.data == 'back_to_main':
@@ -119,17 +121,24 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- LOGIN FLOW ---
 async def login_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['login_api_id'] = update.message.text
-    await update.message.reply_text("Send **API Hash**:")
+    text = update.message.text
+    if text.lower() == '/start': return await start(update, context)
+    context.user_data['login_api_id'] = text
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')]]
+    await update.message.reply_text("Send <b>API Hash</b>:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     return LOGIN_API_HASH
 
 async def login_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['login_api_hash'] = update.message.text
-    await update.message.reply_text("Send **Phone Number** (with country code, e.g., +91...):")
+    text = update.message.text
+    if text.lower() == '/start': return await start(update, context)
+    context.user_data['login_api_hash'] = text
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')]]
+    await update.message.reply_text("Send <b>Phone Number</b> (with country code, e.g., +91...):", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     return LOGIN_PHONE
 
 async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text
+    if phone.lower() == '/start': return await start(update, context)
     context.user_data['login_phone'] = phone
     
     api_id = context.user_data['login_api_id']
@@ -140,34 +149,36 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sent = await client.send_code_request(phone)
         context.user_data['phone_code_hash'] = sent.phone_code_hash
-        context.user_data['login_client'] = client # Keep client alive
-        await update.message.reply_text("OTP sent! Please send the **OTP**:")
+        context.user_data['login_client'] = client 
+        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')]]
+        await update.message.reply_text("OTP sent! Please send the <b>OTP</b>:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         return LOGIN_OTP
     except Exception as e:
-        await update.message.reply_text(f"Error: {e}\n\nRestart login with /start")
+        await update.message.reply_text(f"Error: {e}\n\nRestart login with /start", parse_mode='HTML')
         await client.disconnect()
         return ConversationHandler.END
 
 async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     otp = update.message.text
+    if otp.lower() == '/start': return await start(update, context)
     client = context.user_data['login_client']
     phone = context.user_data['login_phone']
     code_hash = context.user_data['phone_code_hash']
     
     try:
         await client.sign_in(phone, otp, phone_code_hash=code_hash)
-        # Success!
         session_str = client.session.save()
         cursor.execute("DELETE FROM credentials")
         cursor.execute("INSERT INTO credentials (api_id, api_hash, phone, session_str) VALUES (?, ?, ?, ?)",
                       (context.user_data['login_api_id'], context.user_data['login_api_hash'], phone, session_str))
         conn.commit()
-        await update.message.reply_text("✅ Login successful!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Go to Menu", callback_data='back_to_main')]]))
+        await update.message.reply_text("✅ <b>Login successful!</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Go to Menu", callback_data='back_to_main')]]), parse_mode='HTML')
         await client.disconnect()
         return MENU
     except Exception as e:
         if "password" in str(e).lower():
-            await update.message.reply_text("This account has 2FA. Please send your **Password**:")
+            keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')]]
+            await update.message.reply_text("This account has 2FA. Please send your <b>Password</b>:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
             return LOGIN_PASSWORD
         await update.message.reply_text(f"Error: {e}")
         await client.disconnect()
@@ -175,6 +186,7 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text
+    if password.lower() == '/start': return await start(update, context)
     client = context.user_data['login_client']
     try:
         await client.sign_in(password=password)
@@ -183,7 +195,7 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("INSERT INTO credentials (api_id, api_hash, phone, session_str) VALUES (?, ?, ?, ?)",
                       (context.user_data['login_api_id'], context.user_data['login_api_hash'], context.user_data['login_phone'], session_str))
         conn.commit()
-        await update.message.reply_text("✅ Login successful (2FA)!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Go to Menu", callback_data='back_to_main')]]))
+        await update.message.reply_text("✅ <b>Login successful (2FA)!</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Go to Menu", callback_data='back_to_main')]]), parse_mode='HTML')
         await client.disconnect()
         return MENU
     except Exception as e:
@@ -299,13 +311,18 @@ def main():
             WAIT_FOLDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_folder),
                          CallbackQueryHandler(get_folder, pattern='^skip_folder$'),
                          CallbackQueryHandler(type_handler, pattern='^back_to_main$')],
-            LOGIN_API_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_api_id)],
-            LOGIN_API_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_api_hash)],
-            LOGIN_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
-            LOGIN_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)],
-            LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
+            LOGIN_API_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_api_id),
+                          CallbackQueryHandler(menu_handler, pattern='^back_to_main$')],
+            LOGIN_API_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_api_hash),
+                            CallbackQueryHandler(menu_handler, pattern='^back_to_main$')],
+            LOGIN_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone),
+                         CallbackQueryHandler(menu_handler, pattern='^back_to_main$')],
+            LOGIN_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp),
+                       CallbackQueryHandler(menu_handler, pattern='^back_to_main$')],
+            LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password),
+                            CallbackQueryHandler(menu_handler, pattern='^back_to_main$')],
         },
-        fallbacks=[CommandHandler("start", start)]
+        fallbacks=[CommandHandler("start", start), CallbackQueryHandler(menu_handler, pattern='^back_to_main$')]
     )
     
     app.add_handler(conv_handler)
