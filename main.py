@@ -4,7 +4,7 @@ import logging
 import re
 from datetime import datetime
 from telethon import TelegramClient
-from telethon.tl.functions.channels import CreateChannelRequest, GetFullChannelRequest
+from telethon.tl.functions.channels import CreateChannelRequest
 from telethon.tl.functions.messages import UpdatePinnedMessageRequest
 from telethon.tl.functions.folders import EditPeerFoldersRequest
 from telethon.tl.types import InputFolderPeer
@@ -25,8 +25,6 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS projects
                   folder TEXT, folder_id INTEGER, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 cursor.execute('''CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, count INTEGER DEFAULT 0)''')
 conn.commit()
-
-client = TelegramClient('session', API_ID, API_HASH)
 
 # States
 WAIT_TYPE, WAIT_QUANTITY, WAIT_FOLDER = range(3)
@@ -102,98 +100,90 @@ async def get_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     project_name = f"{folder_name}" if folder_name != "None" else "Channel"
     
-    # Save to DB
     cursor.execute("INSERT INTO projects (name, type, quantity, folder, status) VALUES (?, ?, ?, ?, ?)",
                   (project_name, context.user_data['project_type'], context.user_data['quantity'], 
                    folder_name, 'processing'))
     conn.commit()
     project_id = cursor.lastrowid
 
-    # Start execution automatically
     asyncio.create_task(execute_creation(update, context, project_id, folder_name))
     return ConversationHandler.END
 
 async def execute_creation(update, context, project_id, folder_name):
-    if not await client.is_user_authorized():
-        await client.start(phone=PHONE)
+    client = TelegramClient('session', API_ID, API_HASH)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.start(phone=PHONE)
 
-    cursor.execute("SELECT * FROM projects WHERE id=?", (project_id,))
-    proj = cursor.fetchone()
-    total_qty = proj[3]
-    p_type = proj[2]
-    
-    base_name = folder_name if folder_name != "None" else "Channel"
-    
-    # Logic to detect existing numbers
-    existing_numbers = set()
-    async for dialog in client.iter_dialogs():
-        if dialog.name.startswith(base_name):
-            match = re.search(rf"{re.escape(base_name)}(\d+)", dialog.name)
-            if match:
-                existing_numbers.add(int(match.group(1)))
-    
-    created_count = 0
-    num = 1
-    while created_count < total_qty:
-        # Per-day limit check
-        if await check_daily_limit() >= 20:
-            msg = f"⏳ Daily limit (20) reached. Project {proj[1]} paused. Bot will continue tomorrow or when limit resets."
-            if update.message: await update.message.reply_text(msg)
-            else: await update.callback_query.message.reply_text(msg)
-            return # Stop for today but status remains processing
-
-        # Skip existing or missing numbers logic
-        if num in existing_numbers:
-            num += 1
-            continue
-
-        try:
-            title = f"{base_name}{num:03d}"
-            result = await client(CreateChannelRequest(
-                title=title, 
-                about="Birth Certificate Services",
-                megagroup=(p_type == 'group')
-            ))
-            channel = result.chats[0]
-            
-            # Post & Pin
-            try:
-                # Wait for channel to be ready
-                await asyncio.sleep(2)
-                await client.send_file(channel, 'birth_cert.jpg', caption=f"🔥 **Service Available**\n\n{title}")
-                await client(UpdatePinnedMessageRequest(channel=channel, id=1, pm_oneside=True))
-            except Exception as e:
-                print(f"Post/Pin error: {e}")
-
-            # Archive / Folder logic
-            try:
-                # Folder ID 1 is usually Archive in Telegram
-                await client(EditPeerFoldersRequest(folder_peers=[InputFolderPeer(peer=channel, folder_id=1)]))
-            except Exception as e:
-                print(f"Archive error: {e}")
-            
-            created_count += 1
-            await update_daily_count(1)
-            num += 1
-            
-            # Safety delay
-            await asyncio.sleep(60)
-            
-        except Exception as e:
-            msg = f"Error creating {title}: {str(e)}"
-            if "flood" in str(e).lower():
-                await update.message.reply_text("🛑 Flood wait triggered. Stopping for now.")
+        cursor.execute("SELECT * FROM projects WHERE id=?", (project_id,))
+        proj = cursor.fetchone()
+        total_qty = proj[3]
+        p_type = proj[2]
+        
+        base_name = folder_name if folder_name != "None" else "Channel"
+        
+        existing_numbers = set()
+        async for dialog in client.iter_dialogs():
+            if dialog.name and dialog.name.startswith(base_name):
+                match = re.search(rf"{re.escape(base_name)}(\d+)", dialog.name)
+                if match:
+                    existing_numbers.add(int(match.group(1)))
+        
+        created_count = 0
+        num = 1
+        while created_count < total_qty:
+            if await check_daily_limit() >= 20:
+                msg = f"⏳ Daily limit (20) reached. Project {proj[1]} paused."
+                if update.message: await update.message.reply_text(msg)
+                else: await update.callback_query.message.reply_text(msg)
                 return
-            if update.message: await update.message.reply_text(msg)
-            num += 1
-            continue
 
-    cursor.execute("UPDATE projects SET status='complete' WHERE id=?", (project_id,))
-    conn.commit()
-    
-    final_msg = f"✅ **Project Complete!** Created {created_count} {p_type}s for {base_name}."
-    if update.message: await update.message.reply_text(final_msg)
-    else: await update.callback_query.message.reply_text(final_msg)
+            if num in existing_numbers:
+                num += 1
+                continue
+
+            try:
+                title = f"{base_name}{num:03d}"
+                result = await client(CreateChannelRequest(
+                    title=title, 
+                    about="Birth Certificate Services",
+                    megagroup=(p_type == 'group')
+                ))
+                channel = result.chats[0]
+                
+                await asyncio.sleep(2)
+                try:
+                    await client.send_file(channel, 'birth_cert.jpg', caption=f"🔥 **Service Available**\n\n{title}")
+                    await client(UpdatePinnedMessageRequest(channel=channel, id=1, pm_oneside=True))
+                except: pass
+
+                try:
+                    await client(EditPeerFoldersRequest(folder_peers=[InputFolderPeer(peer=channel, folder_id=1)]))
+                except: pass
+                
+                created_count += 1
+                await update_daily_count(1)
+                num += 1
+                await asyncio.sleep(60)
+                
+            except Exception as e:
+                msg = f"Error creating {title}: {str(e)}"
+                if "flood" in str(e).lower():
+                    await update.message.reply_text("🛑 Flood wait triggered. Stopping for now.")
+                    return
+                if update.message: await update.message.reply_text(msg)
+                num += 1
+                continue
+
+        cursor.execute("UPDATE projects SET status='complete' WHERE id=?", (project_id,))
+        conn.commit()
+        
+        final_msg = f"✅ **Project Complete!** Created {created_count} {p_type}s."
+        if update.message: await update.message.reply_text(final_msg)
+        else: await update.callback_query.message.reply_text(final_msg)
+    finally:
+        await client.disconnect()
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
