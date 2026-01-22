@@ -15,6 +15,9 @@ from telethon.tl.types import InputFolderPeer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
+from telethon.errors import FloodWaitError
+import random
+
 # Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -340,6 +343,16 @@ async def execute_creation(update, context, project_id, folder_name, delay, user
                 import random
                 wait_time = random.randint(60, 180)
                 await asyncio.sleep(wait_time)
+            except FloodWaitError as e:
+                # Add 10-15 minutes extra random delay as requested
+                extra_wait = random.randint(600, 900)
+                total_wait = e.seconds + extra_wait
+                
+                logger.warning(f"FloodWait detected for user {user_id}. Waiting {total_wait}s (includes extra {extra_wait}s).")
+                try:
+                    await update.effective_message.reply_text(f"⚠️ Telegram limit reached. Bot will sleep for {total_wait//60} minutes to keep your account safe.")
+                except: pass
+                await asyncio.sleep(total_wait)
             except Exception as e:
                 logger.error(f"Loop error: {e}")
                 num += 1
