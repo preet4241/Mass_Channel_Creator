@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Config
 BOT_TOKEN = '8028312869:AAErsD7WmHHw11c2lL2Jdoj_DBU4bqRv_kQ'
+OWNER_ID = 5790400813  # Example Owner ID - User can change this
 DAILY_LIMIT = 50
 
 # Database setup
@@ -94,13 +95,26 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Project", callback_data='menu_add')],
-        [InlineKeyboardButton("👤 My Account", callback_data='menu_account'),
-         InlineKeyboardButton("📊 Status", callback_data='menu_status')]
-    ]
+    user_id = update.effective_user.id
+    
+    if user_id == OWNER_ID:
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Project", callback_data='menu_add')],
+            [InlineKeyboardButton("👥 User", callback_data='owner_users'),
+             InlineKeyboardButton("📢 Broadcast", callback_data='owner_broadcast')],
+            [InlineKeyboardButton("📊 Status", callback_data='menu_status'),
+             InlineKeyboardButton("⚙️ Setting", callback_data='owner_settings')]
+        ]
+        msg = '👑 <b>Owner Admin Panel</b>\n\nWelcome back, Boss! Control your system from here:'
+    else:
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Project", callback_data='menu_add')],
+            [InlineKeyboardButton("👤 My Account", callback_data='menu_account'),
+             InlineKeyboardButton("📊 Status", callback_data='menu_status')]
+        ]
+        msg = '🤖 <b>Smart Manager Bot</b>\n\nChoose an option:'
+        
     reply_markup = InlineKeyboardMarkup(keyboard)
-    msg = '🤖 <b>Smart Manager Bot</b>\n\nChoose an option:'
     if update.callback_query:
         await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='HTML')
     else:
@@ -167,6 +181,27 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == 'back_to_main':
         return await start(update, context)
+
+    elif query.data == 'owner_users':
+        cursor.execute("SELECT COUNT(DISTINCT user_id) FROM credentials")
+        count = cursor.fetchone()[0]
+        await query.edit_message_text(f"👥 <b>Total Active Users:</b> {count}", 
+                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]), 
+                                    parse_mode='HTML')
+        return MENU
+
+    elif query.data == 'owner_broadcast':
+        await query.edit_message_text("📢 Send the message you want to broadcast to all users:", 
+                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]), 
+                                    parse_mode='HTML')
+        # Here we could add a state for broadcast if needed
+        return MENU
+
+    elif query.data == 'owner_settings':
+        await query.edit_message_text(f"⚙️ <b>Global Settings</b>\n\nDaily Limit: {DAILY_LIMIT}\nFlood Extra: 10-15m", 
+                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]), 
+                                    parse_mode='HTML')
+        return MENU
 
 async def project_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
