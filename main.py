@@ -35,14 +35,14 @@ try:
     conn = sqlite3.connect('projects.db', check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS projects 
-                     (id INTEGER PRIMARY KEY, name TEXT, type TEXT, quantity INTEGER, 
+                     (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, type TEXT, quantity INTEGER, 
                       folder TEXT, folder_id INTEGER, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS project_details 
                      (id INTEGER PRIMARY KEY, project_id INTEGER, channel_name TEXT, 
                       channel_id INTEGER, invite_link TEXT, creation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, count INTEGER DEFAULT 0)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS daily_stats (user_id INTEGER, date TEXT, count INTEGER DEFAULT 0, PRIMARY KEY (user_id, date))''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS credentials 
-                     (id INTEGER PRIMARY KEY, api_id TEXT, api_hash TEXT, phone TEXT, session_str TEXT)''')
+                     (user_id INTEGER PRIMARY KEY, api_id TEXT, api_hash TEXT, phone TEXT, session_str TEXT)''')
     conn.commit()
 except sqlite3.Error as e:
     logger.error(f"Database error during setup: {e}")
@@ -52,13 +52,13 @@ except sqlite3.Error as e:
 (MENU, WAIT_TYPE, WAIT_QUANTITY, WAIT_FOLDER, 
  LOGIN_API_ID, LOGIN_API_HASH, LOGIN_PHONE, LOGIN_OTP, LOGIN_PASSWORD, WAIT_DELAY) = range(10)
 
-async def check_daily_limit():
+async def check_daily_limit(user_id):
     try:
         today = datetime.now().strftime('%Y-%m-%d')
-        cursor.execute("SELECT count FROM daily_stats WHERE date=?", (today,))
+        cursor.execute("SELECT count FROM daily_stats WHERE user_id=? AND date=?", (user_id, today))
         row = cursor.fetchone()
         if not row:
-            cursor.execute("INSERT INTO daily_stats (date, count) VALUES (?, 0)", (today,))
+            cursor.execute("INSERT INTO daily_stats (user_id, date, count) VALUES (?, ?, 0)", (user_id, today))
             conn.commit()
             return 0
         return row[0]
@@ -66,17 +66,17 @@ async def check_daily_limit():
         logger.error(f"Error checking daily limit: {e}")
         return 0
 
-async def update_daily_count(add):
+async def update_daily_count(user_id, add):
     try:
         today = datetime.now().strftime('%Y-%m-%d')
-        cursor.execute("UPDATE daily_stats SET count = count + ? WHERE date=?", (add, today))
+        cursor.execute("UPDATE daily_stats SET count = count + ? WHERE user_id=? AND date=?", (add, user_id, today))
         conn.commit()
     except sqlite3.Error as e:
         logger.error(f"Error updating daily count: {e}")
 
-async def get_creds():
+async def get_creds(user_id):
     try:
-        cursor.execute("SELECT api_id, api_hash, phone, session_str FROM credentials LIMIT 1")
+        cursor.execute("SELECT api_id, api_hash, phone, session_str FROM credentials WHERE user_id=?", (user_id,))
         return cursor.fetchone()
     except sqlite3.Error as e:
         logger.error(f"Error getting credentials: {e}")
@@ -109,7 +109,8 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if query.data == 'menu_add':
-        creds = await get_creds()
+        user_id = update.effective_user.id
+        creds = await get_creds(user_id)
         if not creds or not creds[3]:
             keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
             await query.edit_message_text("❌ <b>Login Required!</b>\n\nPlease login in <b>My Account</b> first.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
@@ -124,16 +125,17 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAIT_TYPE
 
     elif query.data == 'menu_status':
-        cursor.execute("SELECT * FROM projects ORDER BY created_at DESC LIMIT 10")
+        user_id = update.effective_user.id
+        cursor.execute("SELECT * FROM projects WHERE user_id=? ORDER BY created_at DESC LIMIT 10", (user_id,))
         projects = cursor.fetchall()
         text = "📋 <b>Project Status Panel</b>\n\n"
         if not projects:
             text += "No projects found."
         else:
             for proj in projects:
-                status_icon = "✅" if proj[6] == 'complete' else "⏳"
-                text += f"{status_icon} <b>{proj[1]}</b> ({proj[2]})\n"
-                text += f"   └ Status: {proj[6].capitalize()} | Qty: {proj[3]}\n"
+                status_icon = "✅" if proj[7] == 'complete' else "⏳"
+                text += f"{status_icon} <b>{proj[2]}</b> ({proj[3]})\n"
+                text += f"   └ Status: {proj[7].capitalize()} | Qty: {proj[4]}\n"
                 text += f"   └ Details: /details_{proj[0]}\n\n"
         
         keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]
@@ -141,7 +143,8 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MENU
 
     elif query.data == 'menu_account':
-        creds = await get_creds()
+        user_id = update.effective_user.id
+        creds = await get_creds(user_id)
         if not creds or not creds[3]:
             keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')]]
             await query.edit_message_text("❌ <b>No account logged in.</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
@@ -153,7 +156,8 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MENU
 
     elif query.data == 'account_logout':
-        cursor.execute("DELETE FROM credentials")
+        user_id = update.effective_user.id
+        cursor.execute("DELETE FROM credentials WHERE user_id=?", (user_id,))
         conn.commit()
         await query.edit_message_text("✅ <b>Logged out.</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_to_main')]]), parse_mode='HTML')
         return MENU
@@ -219,8 +223,9 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.user_data['login_client'].sign_in(context.user_data['login_phone'], update.message.text, phone_code_hash=context.user_data['phone_code_hash'])
         session_str = context.user_data['login_client'].session.save()
-        cursor.execute("INSERT INTO credentials (api_id, api_hash, phone, session_str) VALUES (?, ?, ?, ?)",
-                      (context.user_data['login_api_id'], context.user_data['login_api_hash'], context.user_data['login_phone'], session_str))
+        user_id = update.effective_user.id
+        cursor.execute("INSERT OR REPLACE INTO credentials (user_id, api_id, api_hash, phone, session_str) VALUES (?, ?, ?, ?, ?)",
+                      (user_id, context.user_data['login_api_id'], context.user_data['login_api_hash'], context.user_data['login_phone'], session_str))
         conn.commit()
         await update.message.reply_text("✅ <b>Login success!</b>", parse_mode='HTML')
         await context.user_data['login_client'].disconnect()
@@ -236,8 +241,9 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.user_data['login_client'].sign_in(password=update.message.text)
         session_str = context.user_data['login_client'].session.save()
-        cursor.execute("INSERT INTO credentials (api_id, api_hash, phone, session_str) VALUES (?, ?, ?, ?)",
-                      (context.user_data['login_api_id'], context.user_data['login_api_hash'], context.user_data['login_phone'], session_str))
+        user_id = update.effective_user.id
+        cursor.execute("INSERT OR REPLACE INTO credentials (user_id, api_id, api_hash, phone, session_str) VALUES (?, ?, ?, ?, ?)",
+                      (user_id, context.user_data['login_api_id'], context.user_data['login_api_hash'], context.user_data['login_phone'], session_str))
         conn.commit()
         await update.message.reply_text("✅ <b>Login success!</b>", parse_mode='HTML')
         await context.user_data['login_client'].disconnect()
@@ -266,15 +272,16 @@ async def get_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     folder_name = update.message.text if not update.callback_query else "None"
-    cursor.execute("INSERT INTO projects (name, type, quantity, folder, status) VALUES (?, ?, ?, ?, ?)",
-                  (folder_name if folder_name != "None" else "Project", context.user_data['project_type'], 
+    user_id = update.effective_user.id
+    cursor.execute("INSERT INTO projects (user_id, name, type, quantity, folder, status) VALUES (?, ?, ?, ?, ?, ?)",
+                  (user_id, folder_name if folder_name != "None" else "Project", context.user_data['project_type'], 
                    context.user_data['quantity'], folder_name, 'processing'))
     conn.commit()
-    asyncio.create_task(execute_creation(update, context, cursor.lastrowid, folder_name, context.user_data['delay']))
+    asyncio.create_task(execute_creation(update, context, cursor.lastrowid, folder_name, context.user_data['delay'], user_id))
     return ConversationHandler.END
 
-async def execute_creation(update, context, project_id, folder_name, delay):
-    creds = await get_creds()
+async def execute_creation(update, context, project_id, folder_name, delay, user_id):
+    creds = await get_creds(user_id)
     if not creds: return
     client = TelegramClient(StringSession(creds[3]), creds[0], creds[1])
     try:
@@ -283,21 +290,33 @@ async def execute_creation(update, context, project_id, folder_name, delay):
         proj = cursor.fetchone()
         base_name = folder_name if folder_name != "None" else "Channel"
         
+        # Fixed naming with hyphen
+        naming_base = f"{base_name}-A"
+        
         existing_nums = set()
         async for dialog in client.iter_dialogs():
-            if dialog.name and dialog.name.startswith(base_name):
-                match = re.search(rf"{re.escape(base_name)}(\d+)", dialog.name)
+            if dialog.name and dialog.name.startswith(naming_base):
+                match = re.search(rf"{naming_base}(\d+)", dialog.name)
                 if match: existing_nums.add(int(match.group(1)))
         
         created = 0
         num = 1
-        while created < proj[3]:
-            if await check_daily_limit() >= DAILY_LIMIT: return
+        while created < proj[4]:
+            if await check_daily_limit(user_id) >= DAILY_LIMIT:
+                # Limit reached, wait for next day
+                logger.info(f"User {user_id} reached daily limit. Waiting for tomorrow.")
+                await update.effective_message.reply_text(f"⚠️ Daily limit (50) reached for project <b>{base_name}</b>. Remaining will be created tomorrow.", parse_mode='HTML')
+                
+                # Sleep until next day (check every hour)
+                while await check_daily_limit(user_id) >= DAILY_LIMIT:
+                    await asyncio.sleep(3600)
+                continue
+
             if num in existing_nums: num += 1; continue
             
             try:
-                title = f"{base_name}{num:03d}"
-                res = await client(CreateChannelRequest(title=title, about="Svc", megagroup=(proj[2]=='group')))
+                title = f"{naming_base}{num:03d}"
+                res = await client(CreateChannelRequest(title=title, about="Svc", megagroup=(proj[3]=='group')))
                 channel = res.chats[0]
                 await asyncio.sleep(2)
                 
@@ -314,12 +333,17 @@ async def execute_creation(update, context, project_id, folder_name, delay):
                 await client(EditPeerFoldersRequest(folder_peers=[InputFolderPeer(peer=channel, folder_id=1)]))
                 
                 created += 1
-                await update_daily_count(1)
+                await update_daily_count(user_id, 1)
                 num += 1
-                await asyncio.sleep(delay)
+                
+                # Random delay 1-3 minutes (60-180 seconds)
+                import random
+                wait_time = random.randint(60, 180)
+                await asyncio.sleep(wait_time)
             except Exception as e:
                 logger.error(f"Loop error: {e}")
-                num += 1; await asyncio.sleep(delay)
+                num += 1
+                await asyncio.sleep(10)
         cursor.execute("UPDATE projects SET status='complete' WHERE id=?", (project_id,))
         conn.commit()
     finally: await client.disconnect()
