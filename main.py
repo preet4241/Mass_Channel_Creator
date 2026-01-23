@@ -244,35 +244,70 @@ async def login_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text
     context.user_data['login_phone'] = phone
-    client = TelegramClient(StringSession(), context.user_data['login_api_id'], context.user_data['login_api_hash'])
+    
+    # Check if we already have an active client to prevent multiple sessions
+    if 'login_client' in context.user_data:
+        try:
+            await context.user_data['login_client'].disconnect()
+        except: pass
+        
+    client = TelegramClient(
+        StringSession(), 
+        context.user_data['login_api_id'], 
+        context.user_data['login_api_hash'],
+        device_model="PC 64bit",
+        system_version="Windows 10",
+        app_version="4.12.2"
+    )
     await client.connect()
     try:
+        # Request code and store hash immediately
         sent = await client.send_code_request(phone)
         context.user_data['phone_code_hash'] = sent.phone_code_hash
         context.user_data['login_client'] = client 
-        await update.message.reply_text("OTP sent! Send <b>OTP</b>:", parse_mode='HTML')
+        await update.message.reply_text("✅ OTP sent! Please check your Telegram and send the <b>OTP</b> here immediately:", parse_mode='HTML')
         return LOGIN_OTP
     except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+        await update.message.reply_text(f"❌ Error during code request: {e}")
         await client.disconnect()
+        if 'login_client' in context.user_data: del context.user_data['login_client']
         return ConversationHandler.END
 
 async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    otp = update.message.text.strip()
+    client = context.user_data.get('login_client')
+    
+    if not client or not client.is_connected():
+        await update.message.reply_text("❌ Connection lost. Please start login again.")
+        return ConversationHandler.END
+
     try:
-        await context.user_data['login_client'].sign_in(context.user_data['login_phone'], update.message.text, phone_code_hash=context.user_data['phone_code_hash'])
-        session_str = context.user_data['login_client'].session.save()
+        await client.sign_in(context.user_data['login_phone'], otp, phone_code_hash=context.user_data['phone_code_hash'])
+        session_str = client.session.save()
         user_id = update.effective_user.id
         cursor.execute("INSERT OR REPLACE INTO credentials (user_id, api_id, api_hash, phone, session_str) VALUES (?, ?, ?, ?, ?)",
                       (user_id, context.user_data['login_api_id'], context.user_data['login_api_hash'], context.user_data['login_phone'], session_str))
         conn.commit()
-        await update.message.reply_text("✅ <b>Login success!</b>", parse_mode='HTML')
-        await context.user_data['login_client'].disconnect()
+        await update.message.reply_text("✅ <b>Login success!</b> Your account is now linked.", parse_mode='HTML')
+        await client.disconnect()
+        if 'login_client' in context.user_data: del context.user_data['login_client']
         return MENU
     except Exception as e:
-        if "password" in str(e).lower():
-            await update.message.reply_text("Enter <b>2FA Password</b>:", parse_mode='HTML')
+        err_msg = str(e).lower()
+        if "expired" in err_msg:
+            # Offer more detail if it expires
+            await update.message.reply_text("❌ <b>The code has expired or is invalid.</b>\nThis can happen if you take too long or if Telegram invalidates the session. Please try again from 👤 <b>My Account</b> and enter the code as soon as you receive it.", parse_mode='HTML')
+        elif "shared" in err_msg or "previously shared" in err_msg:
+            await update.message.reply_text("❌ <b>Security Warning:</b> Telegram blocked this login because this code was previously shared. <b>Tip:</b> Do not copy-paste the code from another chat, type it manually.", parse_mode='HTML')
+        elif "password" in err_msg:
+            await update.message.reply_text("🔐 <b>2FA Enabled!</b> Please enter your <b>Cloud Password</b>:", parse_mode='HTML')
             return LOGIN_PASSWORD
-        await update.message.reply_text(f"Error: {e}")
+        else:
+            await update.message.reply_text(f"❌ Error: {e}")
+        
+        # Cleanup on failure
+        await client.disconnect()
+        if 'login_client' in context.user_data: del context.user_data['login_client']
         return ConversationHandler.END
 
 async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
