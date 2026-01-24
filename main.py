@@ -1,10 +1,24 @@
+import os
 import random
 import asyncio
 import sqlite3
 import logging
 import re
 import pytz
+from threading import Thread
+from flask import Flask
 from datetime import datetime
+
+# Flask server setup
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 from telethon import TelegramClient
 from telethon.tl.functions.channels import CreateChannelRequest, EditAdminRequest
 from telethon.tl.functions.messages import UpdatePinnedMessageRequest, ToggleDialogPinRequest, GetDialogFiltersRequest, UpdateDialogFilterRequest, ExportChatInviteRequest
@@ -260,4 +274,6 @@ def main():
     app.run_polling()
 
 if __name__ == '__main__':
+    # Start Flask in a separate thread
+    Thread(target=run_flask, daemon=True).start()
     main()
