@@ -3,3 +3,4 @@ telethon==1.36.0
 asyncio
 python-telegram-bot
 telethon
+pytz
