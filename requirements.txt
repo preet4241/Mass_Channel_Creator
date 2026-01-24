@@ -1,6 +1,5 @@
 python-telegram-bot==20.7
 telethon==1.36.0
-sqlite3
 asyncio
 python-telegram-bot
 telethon
