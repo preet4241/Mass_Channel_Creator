@@ -8,6 +8,12 @@ import pytz
 from threading import Thread
 from flask import Flask
 from datetime import datetime
+from telethon import TelegramClient
+from telethon.tl.functions.channels import CreateChannelRequest
+from telethon.tl.functions.messages import UpdatePinnedMessageRequest, ExportChatInviteRequest
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # Flask server setup
 app = Flask(__name__)
@@ -19,14 +25,6 @@ def home():
 def run_flask():
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-from telethon import TelegramClient
-from telethon.tl.functions.channels import CreateChannelRequest, EditAdminRequest
-from telethon.tl.functions.messages import UpdatePinnedMessageRequest, ToggleDialogPinRequest, GetDialogFiltersRequest, UpdateDialogFilterRequest, ExportChatInviteRequest
-from telethon.tl.functions.folders import EditPeerFoldersRequest
-from telethon.tl.types import InputFolderPeer, ChatAdminRights, InputDialogPeer, DialogFilter, InputChannel
-from telethon.errors import FloodWaitError
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # Config
 API_ID = os.getenv("api_id")
@@ -44,7 +42,10 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY,
 conn.commit()
 
 # States
-WAIT_TYPE, WAIT_QUANTITY, WAIT_FOLDER = range(3)
+WAIT_TYPE, WAIT_QUANTITY, WAIT_FOLDER, WAIT_OTP, WAIT_PASSWORD = range(5)
+
+# Auth state storage
+auth_sessions = {}
 
 async def check_daily_limit():
     today = datetime.now().strftime('%Y-%m-%d')
@@ -123,38 +124,99 @@ async def get_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     project_id = cursor.lastrowid
 
-    asyncio.create_task(execute_creation(update, context, project_id, folder_name))
-    return ConversationHandler.END
-
-async def execute_creation(update, context, project_id, folder_name):
-    client = TelegramClient('session', API_ID, API_HASH)
+    # Handle Auth
+    chat_id = update.effective_chat.id
+    client = TelegramClient(f'session_{chat_id}', API_ID, API_HASH)
+    auth_sessions[chat_id] = {
+        'client': client,
+        'project_id': project_id,
+        'folder_name': folder_name
+    }
+    
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            await client.start(phone=PHONE)
+            await client.send_code_request(PHONE)
+            msg = "📲 **OTP Sent!**\nApne Telegram app se OTP dekh kar yahan daalo:"
+            if query: await query.message.reply_text(msg)
+            else: await update.message.reply_text(msg)
+            return WAIT_OTP
+        
+        asyncio.create_task(run_creation_task(update, context, chat_id))
+        return ConversationHandler.END
+    except Exception as e:
+        msg = f"❌ Error: {str(e)}"
+        if query: await query.message.reply_text(msg)
+        else: await update.message.reply_text(msg)
+        if client.is_connected(): await client.disconnect()
+        return ConversationHandler.END
 
+async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    otp = update.message.text.strip()
+    session = auth_sessions.get(chat_id)
+    
+    if not session:
+        await update.message.reply_text("Session expired. /start again.")
+        return ConversationHandler.END
+    
+    client = session['client']
+    try:
+        await client.sign_in(PHONE, otp)
+        await update.message.reply_text("✅ Login Successful! Creation start ho rahi hai...")
+        asyncio.create_task(run_creation_task(update, context, chat_id))
+        return ConversationHandler.END
+    except SessionPasswordNeededError:
+        await update.message.reply_text("🔐 **Two-Step Verification!**\nApna Password daalo:")
+        return WAIT_PASSWORD
+    except Exception as e:
+        await update.message.reply_text(f"❌ OTP Error: {str(e)}\nSahi OTP daalo ya /start karo.")
+        return WAIT_OTP
+
+async def password_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    password = update.message.text.strip()
+    session = auth_sessions.get(chat_id)
+    
+    if not session: return ConversationHandler.END
+    
+    client = session['client']
+    try:
+        await client.sign_in(password=password)
+        await update.message.reply_text("✅ Password Accepted! Creation start ho rahi hai...")
+        asyncio.create_task(run_creation_task(update, context, chat_id))
+        return ConversationHandler.END
+    except Exception as e:
+        await update.message.reply_text(f"❌ Password Error: {str(e)}\nSahi password daalo:")
+        return WAIT_PASSWORD
+
+async def run_creation_task(update, context, chat_id):
+    session = auth_sessions.get(chat_id)
+    if not session: return
+    
+    client = session['client']
+    project_id = session['project_id']
+    folder_name = session['folder_name']
+    
+    try:
         cursor.execute("SELECT * FROM projects WHERE id=?", (project_id,))
         proj = cursor.fetchone()
         total_qty = proj[3]
         p_type = proj[2]
-        
         base_name = folder_name if folder_name != "None" else "Channel"
         
         existing_numbers = set()
         async for dialog in client.iter_dialogs():
             if dialog.name and dialog.name.startswith(base_name):
                 match = re.search(rf"{re.escape(base_name)}(\d+)", dialog.name)
-                if match:
-                    existing_numbers.add(int(match.group(1)))
+                if match: existing_numbers.add(int(match.group(1)))
         
         created_count = 0
         num = 1
         while created_count < total_qty:
             if await check_daily_limit() >= 100:
-                msg = f"⏳ Daily limit (100) reached. Project {proj[1]} paused."
-                if update.message: await update.message.reply_text(msg)
-                else: await update.callback_query.message.reply_text(msg)
-                return
+                await update.effective_message.reply_text(f"⏳ Daily limit (100) reached. Project {proj[1]} paused.")
+                break
 
             if num in existing_numbers:
                 num += 1
@@ -163,97 +225,47 @@ async def execute_creation(update, context, project_id, folder_name):
             try:
                 title = f"{base_name}{num:03d}"
                 result = await client(CreateChannelRequest(
-                    title=title, 
-                    about="Birth Certificate Services",
-                    megagroup=(p_type == 'group')
+                    title=title, about="Birth Certificate Services", megagroup=(p_type == 'group')
                 ))
                 channel = result.chats[0]
-                
                 await asyncio.sleep(2)
                 
-                # Get Invite Link
                 invite_link = "None"
                 try:
                     invite = await client(ExportChatInviteRequest(peer=channel))
                     invite_link = invite.link
-                except Exception as e:
-                    logging.error(f"Error exporting invite: {e}")
+                except Exception: pass
 
-                # Prepare Birth Certificate Message
                 tz = pytz.timezone('Asia/Kolkata')
                 now = datetime.now(tz)
                 p_label = "GROUP" if p_type == 'group' else "CHANNEL"
-                cert_msg = (
-                    f"**`{p_label} BIRTH CERTIFICATE (Internal Record)`**\n"
-                    f"-----------------------------------\n\n"
-                    f"1. **{p_label} Age Details:**\n"
-                    f"   -**Creation Date:** `{now.strftime('%d/%m/%Y')}`\n"
-                    f"   -**Creation Time:** `{now.strftime('%I:%M %p')}`\n"
-                    f"   -**{p_label} Type:** `PRIVATE`\n\n"
-                    f"2. **Key Identification:**\n"
-                    f"   -**Unique {p_label} ID:** `-100{channel.id}`\n"
-                    f"   -**Initial Invite Link:** {invite_link}\n\n"
-                    f"3. **Status & Goal:**\n"
-                    f"   -**Initial Users:** `1 (Creator)`\n"
-                    f"   -**Content Status:** `None`\n"
-                    f"   -**Purpose:** `sell`\n\n"
-                    f"4. **User/Data Source (For Future Value):**\n"
-                    f"   -**Current Users:** `None`\n"
-                    f"   -**User Source/Acquisition Method:** `None`\n\n"
-                    f"**Note:** `This post is pinned to confirm the {p_label.lower()}'s creation age.`"
-                )
+                cert_msg = f"**`{p_label} BIRTH CERTIFICATE`**\n-------------------\n\n1. **Age:** `{now.strftime('%d/%m/%Y %I:%M %p')}`\n2. **ID:** `-100{channel.id}`\n3. **Link:** {invite_link}"
 
                 try:
-                    import os
                     if os.path.exists('birth_cert.jpg'):
-                        msg = await client.send_file(channel, 'birth_cert.jpg', caption=cert_msg)
+                        await client.send_file(channel, 'birth_cert.jpg', caption=cert_msg)
                     else:
                         msg = await client.send_message(channel, cert_msg)
-                    
-                    # Pin the message
                     await client(UpdatePinnedMessageRequest(peer=channel, id=msg.id, pm_oneside=True))
-                except Exception as e:
-                    logging.error(f"Error sending message/pinning: {e}")
+                except Exception: pass
 
                 created_count += 1
                 await update_daily_count(1)
                 num += 1
-                
-                # Random delay between 1 to 3 minutes (60 to 180 seconds)
-                delay = random.randint(60, 180)
-                await asyncio.sleep(delay)
-                
+                await asyncio.sleep(random.randint(60, 180))
             except Exception as e:
                 if isinstance(e, FloodWaitError):
-                    extra_wait = random.randint(600, 900)  # 10-15 minutes extra
-                    total_wait = e.seconds + extra_wait
-                    wait_min = total_wait // 60
-                    
-                    msg = f"🛑 Telegram Flood Wait: {e.seconds}s. Adding extra {extra_wait}s delay. Total wait: {wait_min} min."
-                    logging.warning(msg)
-                    if update.message: await update.message.reply_text(msg)
-                    else: await update.callback_query.message.reply_text(msg)
-                    
-                    await asyncio.sleep(total_wait)
+                    await asyncio.sleep(e.seconds + 60)
                     continue
-
-                msg = f"Error creating {title}: {str(e)}"
-                if "flood" in str(e).lower():
-                    # Fallback for other flood-related string errors
-                    await asyncio.sleep(900) # 15 min wait
-                    continue
-                if update.message: await update.message.reply_text(msg)
                 num += 1
                 continue
 
         cursor.execute("UPDATE projects SET status='complete' WHERE id=?", (project_id,))
         conn.commit()
-        
-        final_msg = f"✅ **Project Complete!** Created {created_count} {p_type}s."
-        if update.message: await update.message.reply_text(final_msg)
-        else: await update.callback_query.message.reply_text(final_msg)
+        await update.effective_message.reply_text(f"✅ **Project Complete!** Created {created_count} {p_type}s.")
     finally:
         await client.disconnect()
+        if chat_id in auth_sessions: del auth_sessions[chat_id]
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -264,7 +276,9 @@ def main():
             WAIT_TYPE: [CallbackQueryHandler(type_handler)],
             WAIT_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_quantity)],
             WAIT_FOLDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_folder),
-                         CallbackQueryHandler(get_folder, pattern='^skip_folder$')]
+                         CallbackQueryHandler(get_folder, pattern='^skip_folder$')],
+            WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_handler)],
+            WAIT_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, password_handler)]
         },
         fallbacks=[CommandHandler("start", start)]
     )
