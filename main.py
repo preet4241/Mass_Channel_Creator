@@ -65,9 +65,10 @@ async def update_daily_count(add):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("📢 Create Channel", callback_data='type_channel')],
                 [InlineKeyboardButton("👥 Create Group", callback_data='type_group')],
+                [InlineKeyboardButton("🔐 Login Account", callback_data='login_account')],
                 [InlineKeyboardButton("📊 Status", callback_data='status')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text('🤖 **Smart Manager Bot**\n\nChoose what to create:', reply_markup=reply_markup, parse_mode='Markdown')
+    await update.message.reply_text('🤖 **Smart Manager Bot**\n\nChoose what to create or manage:', reply_markup=reply_markup, parse_mode='Markdown')
     return WAIT_TYPE
 
 async def type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -75,6 +76,7 @@ async def type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if query.data == 'status':
+        # ... existing status logic ...
         cursor.execute("SELECT * FROM projects ORDER BY created_at DESC LIMIT 10")
         projects = cursor.fetchall()
         if not projects:
@@ -88,9 +90,43 @@ async def type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode='Markdown')
         return ConversationHandler.END
 
+    if query.data == 'login_account':
+        chat_id = update.effective_chat.id
+        client = TelegramClient(f'session_{chat_id}', API_ID, API_HASH)
+        auth_sessions[chat_id] = {'client': client, 'project_id': None, 'folder_name': None}
+        
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                keyboard = [[InlineKeyboardButton("Cancel", callback_data='cancel_auth')]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text("✅ Account is already logged in!", reply_markup=reply_markup)
+                return WAIT_TYPE
+            
+            await client.send_code_request(PHONE)
+            keyboard = [[InlineKeyboardButton("Cancel", callback_data='cancel_auth')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("📲 **Login with OTP**\n\nApne Telegram app se OTP dekh kar yahan daalo:", reply_markup=reply_markup)
+            return WAIT_OTP
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+            return ConversationHandler.END
+
     context.user_data['project_type'] = 'channel' if 'channel' in query.data else 'group'
     await query.edit_message_text(f"How many {context.user_data['project_type']}s create karne hai? (Total Project Quantity)")
     return WAIT_QUANTITY
+
+async def cancel_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    if chat_id in auth_sessions:
+        client = auth_sessions[chat_id]['client']
+        if client.is_connected():
+            await client.disconnect()
+        del auth_sessions[chat_id]
+    await query.edit_message_text("❌ Authentication cancelled.")
+    return ConversationHandler.END
 
 async def get_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -136,12 +172,15 @@ async def get_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await client.connect()
         if not await client.is_user_authorized():
+            # Generate the code request correctly
             await client.send_code_request(PHONE)
             msg = "📲 **OTP Sent!**\nApne Telegram app se OTP dekh kar yahan daalo:"
             if query: await query.message.reply_text(msg)
             else: await update.message.reply_text(msg)
             return WAIT_OTP
         
+        # Already authorized, go straight to creation
+        await update.effective_message.reply_text("✅ Account already logged in. Starting creation...")
         asyncio.create_task(run_creation_task(update, context, chat_id))
         return ConversationHandler.END
     except Exception as e:
@@ -273,12 +312,15 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            WAIT_TYPE: [CallbackQueryHandler(type_handler)],
+            WAIT_TYPE: [CallbackQueryHandler(type_handler),
+                       CallbackQueryHandler(cancel_auth, pattern='^cancel_auth$')],
             WAIT_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_quantity)],
             WAIT_FOLDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_folder),
                          CallbackQueryHandler(get_folder, pattern='^skip_folder$')],
-            WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_handler)],
-            WAIT_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, password_handler)]
+            WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_handler),
+                      CallbackQueryHandler(cancel_auth, pattern='^cancel_auth$')],
+            WAIT_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, password_handler),
+                           CallbackQueryHandler(cancel_auth, pattern='^cancel_auth$')]
         },
         fallbacks=[CommandHandler("start", start)]
     )
